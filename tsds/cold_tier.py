@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pyarrow.compute as pc
+from concurrent.futures import ThreadPoolExecutor
 from .interfaces import StorageTier
 from .logger import get_logger
 
@@ -200,6 +201,28 @@ class ColdTier(StorageTier):
             print("ColdTier: No indexing enabled - skipping background indexing")
         return 0
     
+    async def _process_file_parallel(self, file_path: Path, filters: dict, arrow_filters: Optional[List]) -> Optional[pa.Table]:
+        """Process a single file with filters in a thread pool executor."""
+        try:
+            # Run the file reading in a thread pool to avoid blocking the event loop
+            def read_and_filter():
+                # Use predicate pushdown for better performance
+                table = pq.read_table(file_path, filters=arrow_filters)
+                # Apply additional filters in memory to ensure correctness
+                filtered_table = self._apply_filters(table, filters)
+                return filtered_table if filtered_table.num_rows > 0 else None
+            
+            loop = asyncio.get_event_loop()
+            with ThreadPoolExecutor() as executor:
+                result = await loop.run_in_executor(executor, read_and_filter)
+                return result
+                
+        except Exception as e:
+            if self.debug:
+                print(f"ColdTier: Error reading {file_path}: {e}")
+            self.logger.warning(f"Failed to process file {file_path}: {e}")
+            return None
+
     def _apply_filters(self, table: pa.Table, filters: dict) -> pa.Table:
         """Apply a filter dictionary to a PyArrow Table."""
         if not filters:
@@ -273,32 +296,53 @@ class ColdTier(StorageTier):
             # Convert filters for PyArrow predicate pushDown
             arrow_filters = self._convert_to_arrow_filters(filters)
             
-            # Strategy 1: If we have a small limit, use top-K approach
+            # Get max concurrent files from config
+            max_concurrent = self.config.query.max_concurrent_files if self.config else 10
+            semaphore = asyncio.Semaphore(max_concurrent)
+            
+            # Strategy 1: If we have a small limit, use top-K approach with parallel processing
             if limit and limit <= 100000:  # Top-K optimization for small limits
                 all_records = []
                 
-                for file_path in parquet_files:
-                    try:
-                        # Read only columns needed for sorting + filtering
-                        columns_to_read = set()
-                        if filters:
-                            columns_to_read.update(filters.keys())
-                        columns_to_read.add(sort_by)
-                        
-                        # Read minimal columns first for faster I/O
-                        table = pq.read_table(file_path, filters=arrow_filters, columns=list(columns_to_read))
-                        filtered_table = self._apply_filters(table, filters)
-                        
-                        if filtered_table.num_rows > 0:
-                            # Convert to list of tuples (sort_value, file_path, row_index)  
-                            sort_column = filtered_table.column(sort_by).to_pylist()
-                            for i, sort_value in enumerate(sort_column):
-                                all_records.append((sort_value, file_path, i))
-                    
-                    except Exception as e:
-                        if self.debug:
-                            print(f"ColdTier: Error reading {file_path}: {e}")
-                        continue
+                # Helper function to process file for top-K
+                async def process_file_for_topk(file_path):
+                    async with semaphore:
+                        try:
+                            # Read only columns needed for sorting + filtering
+                            columns_to_read = set()
+                            if filters:
+                                columns_to_read.update(filters.keys())
+                            columns_to_read.add(sort_by)
+                            
+                            def read_minimal_columns():
+                                # Read minimal columns first for faster I/O
+                                table = pq.read_table(file_path, filters=arrow_filters, columns=list(columns_to_read))
+                                filtered_table = self._apply_filters(table, filters)
+                                
+                                if filtered_table.num_rows > 0:
+                                    # Convert to list of tuples (sort_value, file_path, row_index)  
+                                    sort_column = filtered_table.column(sort_by).to_pylist()
+                                    return [(sort_value, file_path, i) for i, sort_value in enumerate(sort_column)]
+                                return []
+                            
+                            # Run in thread pool
+                            loop = asyncio.get_event_loop()
+                            with ThreadPoolExecutor() as executor:
+                                return await loop.run_in_executor(executor, read_minimal_columns)
+                            
+                        except Exception as e:
+                            if self.debug:
+                                print(f"ColdTier: Error reading {file_path}: {e}")
+                            return []
+                
+                # Process files in parallel for top-K
+                tasks = [process_file_for_topk(file_path) for file_path in parquet_files]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                
+                # Collect all records from parallel results
+                for result in results:
+                    if isinstance(result, list):
+                        all_records.extend(result)
                 
                 if all_records:
                     # Sort all records and take top K
@@ -338,45 +382,52 @@ class ColdTier(StorageTier):
                                 yield batch
                 return
                 
-            # Strategy 2: For large or unlimited queries, use chunked processing
+            # Strategy 2: For large or unlimited queries, use chunked parallel processing
             else:
                 all_tables = []
                 max_memory_mb = 500  # Limit memory usage to 500MB
                 current_memory_mb = 0
                 
-                for file_path in parquet_files:
-                    try:
-                        # Read table with predicate pushdown
-                        table = pq.read_table(file_path, filters=arrow_filters)
-                        filtered_table = self._apply_filters(table, filters)
-                        
-                        if filtered_table.num_rows > 0:
-                            # Estimate memory usage (rough approximation)
-                            table_memory_mb = (filtered_table.nbytes) / (1024 * 1024)
+                # Process files in chunks to manage memory and parallelism
+                chunk_size = max_concurrent
+                for i in range(0, len(parquet_files), chunk_size):
+                    chunk_files = parquet_files[i:i + chunk_size]
+                    
+                    # Process this chunk of files in parallel
+                    tasks = [self._process_file_parallel(file_path, filters, arrow_filters) for file_path in chunk_files]
+                    results = await asyncio.gather(*tasks, return_exceptions=True)
+                    
+                    # Process results from this chunk
+                    for file_path, result in zip(chunk_files, results):
+                        if isinstance(result, Exception):
+                            if self.debug:
+                                print(f"ColdTier: Error processing {file_path}: {result}")
+                            continue
                             
-                            # If adding this table would exceed memory limit, process what we have
-                            if current_memory_mb + table_memory_mb > max_memory_mb and all_tables:
-                                # Sort and yield current batch
-                                combined_table = pa.concat_tables(all_tables)
-                                if sort_by in combined_table.schema.names:
-                                    order = 'ascending' if ascending else 'descending'
-                                    combined_table = combined_table.sort_by([(sort_by, order)])
-                                
-                                for batch in combined_table.to_batches():
-                                    if batch.num_rows > 0:
-                                        yield batch
-                                
-                                # Reset for next chunk
-                                all_tables = []
-                                current_memory_mb = 0
-                            
-                            all_tables.append(filtered_table)
-                            current_memory_mb += table_memory_mb
+                        if result is None or result.num_rows == 0:
+                            continue
                         
-                    except Exception as e:
-                        if self.debug:
-                            print(f"ColdTier: Error reading {file_path}: {e}")
-                        continue
+                        # Estimate memory usage (rough approximation)
+                        table_memory_mb = (result.nbytes) / (1024 * 1024)
+                        
+                        # If adding this table would exceed memory limit, process what we have
+                        if current_memory_mb + table_memory_mb > max_memory_mb and all_tables:
+                            # Sort and yield current batch
+                            combined_table = pa.concat_tables(all_tables)
+                            if sort_by in combined_table.schema.names:
+                                order = 'ascending' if ascending else 'descending'
+                                combined_table = combined_table.sort_by([(sort_by, order)])
+                            
+                            for batch in combined_table.to_batches():
+                                if batch.num_rows > 0:
+                                    yield batch
+                            
+                            # Reset for next chunk
+                            all_tables = []
+                            current_memory_mb = 0
+                        
+                        all_tables.append(result)
+                        current_memory_mb += table_memory_mb
                 
                 # Process remaining tables
                 if all_tables:
@@ -394,7 +445,7 @@ class ColdTier(StorageTier):
                             yield batch
             return
         
-        # Original unsorted path
+        # Original unsorted path with parallel processing
         returned_records = 0
         
         # Get all parquet files with potential partition pruning
@@ -412,23 +463,42 @@ class ColdTier(StorageTier):
         # Convert filters for PyArrow predicate pushdown
         arrow_filters = self._convert_to_arrow_filters(filters)
         
-        for file_path in parquet_files:
+        # Get max concurrent files from config
+        max_concurrent = self.config.query.max_concurrent_files if self.config else 10
+        semaphore = asyncio.Semaphore(max_concurrent)
+        
+        # Process files in parallel batches
+        async def process_file_with_semaphore(file_path):
+            async with semaphore:
+                return await self._process_file_parallel(file_path, filters, arrow_filters)
+        
+        # Process files in chunks to avoid overwhelming memory
+        chunk_size = max_concurrent * 2  # Process 2x concurrent limit at a time
+        for i in range(0, len(parquet_files), chunk_size):
             if limit and returned_records >= limit:
                 break
-            
-            try:
-                # Use predicate pushdown for better performance
-                table = pq.read_table(file_path, filters=arrow_filters)
-
-                # The predicate pushdown might not handle all cases perfectly,
-                # so we apply the filters again in memory to ensure correctness.
-                filtered_table = self._apply_filters(table, filters)
                 
-                if filtered_table.num_rows == 0:
+            chunk_files = parquet_files[i:i + chunk_size]
+            
+            # Process this chunk of files in parallel
+            tasks = [process_file_with_semaphore(file_path) for file_path in chunk_files]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Process results and yield batches
+            for file_path, result in zip(chunk_files, results):
+                if limit and returned_records >= limit:
+                    break
+                    
+                if isinstance(result, Exception):
+                    if self.debug:
+                        print(f"ColdTier: Error processing {file_path}: {result}")
                     continue
-
+                    
+                if result is None:
+                    continue
+                
                 # Convert to batches and apply limit
-                for batch in filtered_table.to_batches():
+                for batch in result.to_batches():
                     if limit and returned_records >= limit:
                         break
                     
@@ -440,11 +510,6 @@ class ColdTier(StorageTier):
                     if batch.num_rows > 0:
                         yield batch
                         returned_records += batch.num_rows
-                        
-            except Exception as e:
-                if self.debug:
-                    print(f"ColdTier: Error reading {file_path}: {e}")
-                continue
     
     async def get_stats(self) -> dict:
         """Get cold tier statistics."""
