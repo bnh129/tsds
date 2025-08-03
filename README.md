@@ -1,15 +1,6 @@
 # TSDS - Time Series Database System
 
-A high-performance, GPU-accelerated time series database built with Python, PyArrow, and CuPy. TSDS features a sophisticated three-tier architecture designed for maximum throughput, reliability, and scalability.
-
-## 🚀 Performance Highlights
-
-- **267K+ records/sec** sustained ingestion throughput
-- **12M+ records/sec** full table scan performance  
-- **2M+ records/sec** filtered query performance
-- **GPU-accelerated** warm tier queries with CuPy
-- **Atomic durability** with Write-Ahead Logging (WAL)
-- **100M+ record** capacity demonstrated
+A high-performance, GPU-accelerated time series database built with Python, PyArrow, and CuPy. TSDS features a three-tier architecture designed for throughput, reliability, and scalability.
 
 ## 🏗️ Architecture Overview
 
