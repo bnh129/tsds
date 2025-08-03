@@ -337,25 +337,10 @@ Enable debug logging in configuration:
 ### Scalability
 - **Horizontal scaling**: Each tier can be tuned independently
 - **Storage growth**: Cold tier supports unlimited Parquet files
-- **Memory management**: Automatic eviction prevents OOM conditions
 
 ### Monitoring
 - **Comprehensive logging**: Tier-specific performance metrics
 - **Memory tracking**: Real-time usage monitoring
 - **Query profiling**: Performance breakdown by tier
 
-## 📝 License
 
-[Add your license information here]
-
-## 🤝 Contributing
-
-[Add contribution guidelines here]
-
-## 📞 Support
-
-[Add support information here]
-
----
-
-**TSDS** - Built for speed, designed for scale, engineered for reliability.
