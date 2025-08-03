@@ -2,7 +2,7 @@
 
 A GPU-accelerated time series datastore built with Python, PyArrow, and CuPy. TSDS features a three-tier architecture designed for throughput, reliability, and scalability.
 
-## 🏗️ Architecture Overview
+## Architecture Overview
 
 ```
 ┌─────────────────┐     ┌─────────────────┐    ┌─────────────────┐
@@ -23,33 +23,33 @@ A GPU-accelerated time series datastore built with Python, PyArrow, and CuPy. TS
 
 Data automatically flows between tiers as capacity thresholds are reached, ensuring optimal performance for both recent and historical data access.
 
-## ✨ Key Features
+## Key Features
 
-### 🔥 High Performance
+### High Performance
 - **GPU Acceleration**: CuPy-powered warm tier for blazing fast queries
 - **Streaming Queries**: Memory-efficient processing with configurable batch sizes
 - **K-way Merge Sorting**: Cross-tier sorted queries with minimal memory overhead
 - **Predicate Pushdown**: Efficient filtering at the storage layer
 
-### 🛡️ Reliability & Durability
+### Reliability & Durability
 - **Write-Ahead Logging**: Arrow IPC format with fsync durability guarantees
 - **Atomic Transactions**: Staging area approach for crash-safe operations
 - **Two-Phase Commit**: Safe tier-to-tier data migration
 - **Crash Recovery**: Automatic WAL replay on system restart
 
-### ⚙️ Configuration Management
+### Configuration Management
 - **JSON Configuration**: Centralized settings with sensible defaults
 - **Environment Variables**: Runtime overrides for deployment flexibility
 - **Hierarchical Loading**: Default → Custom → Environment priority
 - **Hot Reloading**: Configuration changes without restart
 
-### 📊 Advanced Querying
+### Advanced Querying
 - **Complex Filters**: Range, equality, and IN operations
 - **Cross-Tier Sorting**: Global ordering across all storage tiers
 - **Limit Optimization**: Early termination for efficient top-K queries
 - **Schema Flexibility**: Support for various data types and structures
 
-## 🚀 Quick Start
+## Quick Start
 
 ### Installation
 
@@ -154,7 +154,7 @@ python3 tsds_demo.py 1000000 --no-queries  # Skip query benchmarks
 - **Memory Monitoring**: Real-time resource usage
 - **Query Benchmarks**: Various filter and sort combinations
 
-## 🔍 Query System
+## Query System
 
 ### Filter Operations
 
@@ -195,7 +195,7 @@ async for batch in tsds.query(
     process_batch(batch)
 ```
 
-## 🏛️ Architecture Deep Dive
+## Architecture Deep Dive
 
 ### Hot Tier (`hot_tier.py`)
 - **In-Memory Storage**: PyArrow RecordBatches with fast access
@@ -272,24 +272,6 @@ export TSDS_QUERY_BATCH_SIZE=8192
   "performance": {"memory_limit_mb": 4096}
 }
 ```
-
-## 📊 Performance Benchmarks
-
-### Ingestion Performance
-- **100M records**: 267,811 records/sec sustained
-- **Memory efficient**: <600MB RAM for 100M records
-- **GPU utilization**: 1.4GB/2GB (70% efficiency)
-
-### Query Performance  
-- **Full scan**: 12.2M records/sec (100M records in 8.2s)
-- **Filtered queries**: 1.8-2.5M records/sec
-- **Range queries**: Sub-second for most workloads
-- **Sorted queries**: 1.1-1.3s for 12K results from 100M records
-
-### Tier Distribution (100M Records)
-- **Hot Tier**: 775K records (0.8%) - Recent data
-- **Warm Tier**: 34.3M records (34.3%) - GPU-accelerated
-- **Cold Tier**: 64.9M records (64.9%) - Compressed storage
 
 ## 🛠️ Development
 
