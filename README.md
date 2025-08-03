@@ -1,6 +1,6 @@
-# TSDS - Time Series Database System
+# TSDS - Time Series Data Store
 
-A high-performance, GPU-accelerated time series database built with Python, PyArrow, and CuPy. TSDS features a three-tier architecture designed for throughput, reliability, and scalability.
+A GPU-accelerated time series datastore built with Python, PyArrow, and CuPy. TSDS features a three-tier architecture designed for throughput, reliability, and scalability.
 
 ## 🏗️ Architecture Overview
 
