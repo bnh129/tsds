@@ -772,7 +772,7 @@ class ColdTier(StorageTier):
                                 yield batch
             return
         
-        # Original unsorted path with parallel processing
+        # Memory-efficient streaming path for unsorted queries
         returned_records = 0
         
         # Get all parquet files with potential partition pruning
@@ -790,36 +790,27 @@ class ColdTier(StorageTier):
         # Convert filters for PyArrow predicate pushdown
         arrow_filters = self._convert_to_arrow_filters(filters)
         
-        # Use shared thread pool for optimal parallelism without artificial limits
-        # The thread pool already handles concurrency efficiently
-        max_concurrent = self.config.query.max_concurrent_files if self.config else 10
+        self.logger.info(f"Streaming unsorted query across {len(parquet_files)} files with limit={limit}")
         
-        # Process files in chunks to avoid overwhelming memory
-        chunk_size = max_concurrent * 2  # Process 2x concurrent limit at a time
-        for i in range(0, len(parquet_files), chunk_size):
+        # Stream files one at a time to minimize memory usage
+        # This is especially important for large datasets with many files
+        for file_idx, file_path in enumerate(parquet_files):
             if limit and returned_records >= limit:
                 break
+            
+            try:
+                # Process single file asynchronously without accumulating results
+                result = await self._process_file_parallel(file_path, filters, arrow_filters)
                 
-            chunk_files = parquet_files[i:i + chunk_size]
-            
-            # Process this chunk of files in parallel using shared thread pool
-            tasks = [self._process_file_parallel(file_path, filters, arrow_filters) for file_path in chunk_files]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            # Process results and yield batches
-            for file_path, result in zip(chunk_files, results):
-                if limit and returned_records >= limit:
-                    break
-                    
                 if isinstance(result, Exception):
                     if self.debug:
                         print(f"ColdTier: Error processing {file_path}: {result}")
                     continue
                     
-                if result is None:
+                if result is None or result.num_rows == 0:
                     continue
                 
-                # Convert to batches and apply limit
+                # Stream batches immediately without accumulation
                 for batch in result.to_batches():
                     if limit and returned_records >= limit:
                         break
@@ -832,6 +823,22 @@ class ColdTier(StorageTier):
                     if batch.num_rows > 0:
                         yield batch
                         returned_records += batch.num_rows
+                        
+                        # Early exit if limit reached
+                        if limit and returned_records >= limit:
+                            break
+                
+                # Progress logging for large scans
+                if file_idx % 100 == 0 and file_idx > 0:
+                    self.logger.debug(f"Processed {file_idx}/{len(parquet_files)} files, {returned_records:,} records so far")
+                    
+            except Exception as e:
+                if self.debug:
+                    print(f"ColdTier: Error processing {file_path}: {e}")
+                self.logger.warning(f"Failed to process file {file_path}: {e}")
+                continue
+        
+        self.logger.info(f"Unsorted streaming query completed: {returned_records:,} records from {len(parquet_files)} files")
     
     async def get_stats(self) -> dict:
         """Get cold tier statistics."""

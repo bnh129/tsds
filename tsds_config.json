@@ -22,8 +22,8 @@
     "max_thread_workers": 8
   },
   "query": {
-    "output_batch_size": 4096,
-    "max_concurrent_files": 10
+    "output_batch_size": 2048,
+    "max_concurrent_files": 3
   },
   "indexing": {
     "auto_index": false,
