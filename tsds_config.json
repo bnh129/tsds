@@ -11,8 +11,8 @@
     "wal_enabled": true
   },
   "warm_tier": {
-    "max_memory_mb": 2048,
-    "eviction_threshold_pct": 0.9,
+    "max_memory_mb": 4096,
+    "eviction_threshold_pct": 0.85,
     "wal_enabled": true
   },
   "cold_tier": {
@@ -22,8 +22,8 @@
     "max_thread_workers": 8
   },
   "query": {
-    "output_batch_size": 2048,
-    "max_concurrent_files": 3
+    "output_batch_size": 8192,
+    "max_concurrent_files": 4
   },
   "indexing": {
     "auto_index": false,

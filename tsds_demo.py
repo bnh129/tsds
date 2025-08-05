@@ -183,16 +183,24 @@ async def run_comprehensive_queries(tsds, start_time: datetime, schema_mode: str
         print(f"\n  Testing: {description}")
         
         query_start = time.time()
-        results = []
+        total_results = 0
+        batch_count = 0
         
+        # Stream results without accumulating in memory
         async for result_batch in tsds.query(filters=filters, limit=limit):
-            results.append(result_batch)
+            total_results += result_batch.num_rows
+            batch_count += 1
+            
+            # Progress reporting for large scans
+            if total_results % 1_000_000 == 0:
+                elapsed = time.time() - query_start
+                throughput = total_results / elapsed if elapsed > 0 else 0
+                print(f"    Progress: {total_results:,} records in {elapsed:.1f}s ({throughput:,.0f} rec/s)")
         
         query_time = (time.time() - query_start) * 1000
-        total_results = sum(b.num_rows for b in results)
         throughput = total_results / (query_time / 1000) if query_time > 0 else 0
         
-        print(f"    Results: {total_results:,} records in {query_time:.1f}ms")
+        print(f"    Results: {total_results:,} records in {query_time:.1f}ms ({batch_count} batches)")
         print(f"    Throughput: {throughput:,.0f} records/sec")
     
     # Sorting tests
@@ -202,11 +210,13 @@ async def run_comprehensive_queries(tsds, start_time: datetime, schema_mode: str
     print(f"    Testing query with DESCENDING sort by '{sort_column}' (TOP 10)...")
     query_start = time.time()
     desc_results = []
+    total_desc_results = 0
+    
     async for result_batch in tsds.query(sort_by=sort_column, ascending=False, limit=10):
-        desc_results.append(result_batch)
+        desc_results.append(result_batch)  # Small result set, safe to accumulate
+        total_desc_results += result_batch.num_rows
         
     query_time = (time.time() - query_start) * 1000
-    total_desc_results = sum(b.num_rows for b in desc_results)
     print(f"      Descending: {total_desc_results:,} records in {query_time:.1f}ms")
     
     # Show sample of descending results
@@ -221,11 +231,13 @@ async def run_comprehensive_queries(tsds, start_time: datetime, schema_mode: str
     print(f"    Testing query with ASCENDING sort by '{sort_column}' (TOP 10)...")
     query_start = time.time()
     asc_results = []
+    total_asc_results = 0
+    
     async for result_batch in tsds.query(sort_by=sort_column, ascending=True, limit=10):
-        asc_results.append(result_batch)
+        asc_results.append(result_batch)  # Small result set, safe to accumulate
+        total_asc_results += result_batch.num_rows
         
     query_time = (time.time() - query_start) * 1000
-    total_asc_results = sum(b.num_rows for b in asc_results)
     print(f"      Ascending: {total_asc_results:,} records in {query_time:.1f}ms")
     
     # Show sample of ascending results  
@@ -242,23 +254,23 @@ async def run_comprehensive_queries(tsds, start_time: datetime, schema_mode: str
     # Test with limit=5 (should trigger ultra-fast path)
     print(f"    Testing tiny query: TOP 5 records with sort...")
     query_start = time.time()
-    tiny_results = []
+    total_tiny_results = 0
+    
     async for result_batch in tsds.query(sort_by=sort_column, ascending=False, limit=5):
-        tiny_results.append(result_batch)
+        total_tiny_results += result_batch.num_rows
     
     query_time = (time.time() - query_start) * 1000
-    total_tiny_results = sum(b.num_rows for b in tiny_results)
     print(f"      TOP 5: {total_tiny_results:,} records in {query_time:.1f}ms")
     
     # Test with limit=50 (should also trigger ultra-fast path)
     print(f"    Testing small query: TOP 50 records with sort...")
     query_start = time.time()
-    small_results = []
+    total_small_results = 0
+    
     async for result_batch in tsds.query(sort_by=sort_column, ascending=True, limit=50):
-        small_results.append(result_batch)
+        total_small_results += result_batch.num_rows
     
     query_time = (time.time() - query_start) * 1000
-    total_small_results = sum(b.num_rows for b in small_results)
     print(f"      TOP 50: {total_small_results:,} records in {query_time:.1f}ms")
 
 

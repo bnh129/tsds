@@ -445,8 +445,13 @@ class ColdTier(StorageTier):
         try:
             # Run the file reading in a thread pool to avoid blocking the event loop
             def read_and_filter():
-                # Use predicate pushdown for better performance
-                table = pq.read_table(file_path, filters=arrow_filters)
+                # Use predicate pushdown and optimized I/O for better performance
+                table = pq.read_table(
+                    file_path, 
+                    filters=arrow_filters,
+                    use_threads=True,  # Enable multithreaded reading within pyarrow
+                    pre_buffer=True    # Enable prefetching for better I/O performance
+                )
                 # Apply additional filters in memory to ensure correctness
                 filtered_table = self._apply_filters(table, filters)
                 return filtered_table if filtered_table.num_rows > 0 else None
@@ -792,26 +797,56 @@ class ColdTier(StorageTier):
         
         self.logger.info(f"Streaming unsorted query across {len(parquet_files)} files with limit={limit}")
         
-        # Stream files one at a time to minimize memory usage
-        # This is especially important for large datasets with many files
-        for file_idx, file_path in enumerate(parquet_files):
+        # Memory-bounded parallel file streaming for better I/O performance
+        # Process multiple files concurrently while maintaining strict memory limits
+        max_concurrent = min(self.config.query.max_concurrent_files if self.config else 3, 3)  # Conservative limit
+        semaphore = asyncio.Semaphore(max_concurrent)
+        
+        async def process_file_stream(file_path: Path):
+            """Process a single file and yield batches through a queue."""
+            async with semaphore:
+                try:
+                    result = await self._process_file_parallel(file_path, filters, arrow_filters)
+                    
+                    if isinstance(result, Exception) or result is None or result.num_rows == 0:
+                        return []
+                    
+                    # Convert to batches immediately, don't hold full table
+                    batches = []
+                    for batch in result.to_batches():
+                        if batch.num_rows > 0:
+                            batches.append(batch)
+                    return batches
+                    
+                except Exception as e:
+                    if self.debug:
+                        print(f"ColdTier: Error processing {file_path}: {e}")
+                    self.logger.warning(f"Failed to process file {file_path}: {e}")
+                    return []
+        
+        # Process files in small chunks to balance parallelism and memory usage
+        chunk_size = max_concurrent * 2  # Process 2x concurrency at a time
+        
+        for chunk_start in range(0, len(parquet_files), chunk_size):
             if limit and returned_records >= limit:
                 break
+                
+            chunk_files = parquet_files[chunk_start:chunk_start + chunk_size]
             
-            try:
-                # Process single file asynchronously without accumulating results
-                result = await self._process_file_parallel(file_path, filters, arrow_filters)
-                
-                if isinstance(result, Exception):
-                    if self.debug:
-                        print(f"ColdTier: Error processing {file_path}: {result}")
-                    continue
+            # Process this chunk of files in parallel
+            tasks = [process_file_stream(file_path) for file_path in chunk_files]
+            chunk_results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Stream results immediately without accumulation
+            for file_idx, batches in enumerate(chunk_results):
+                if limit and returned_records >= limit:
+                    break
                     
-                if result is None or result.num_rows == 0:
+                if isinstance(batches, Exception) or not batches:
                     continue
                 
-                # Stream batches immediately without accumulation
-                for batch in result.to_batches():
+                # Yield batches immediately
+                for batch in batches:
                     if limit and returned_records >= limit:
                         break
                     
@@ -827,16 +862,11 @@ class ColdTier(StorageTier):
                         # Early exit if limit reached
                         if limit and returned_records >= limit:
                             break
-                
-                # Progress logging for large scans
-                if file_idx % 100 == 0 and file_idx > 0:
-                    self.logger.debug(f"Processed {file_idx}/{len(parquet_files)} files, {returned_records:,} records so far")
-                    
-            except Exception as e:
-                if self.debug:
-                    print(f"ColdTier: Error processing {file_path}: {e}")
-                self.logger.warning(f"Failed to process file {file_path}: {e}")
-                continue
+            
+            # Progress logging for large scans
+            files_processed = min(chunk_start + chunk_size, len(parquet_files))
+            if files_processed % 100 == 0 and files_processed > 0:
+                self.logger.debug(f"Processed {files_processed}/{len(parquet_files)} files, {returned_records:,} records so far")
         
         self.logger.info(f"Unsorted streaming query completed: {returned_records:,} records from {len(parquet_files)} files")
     
