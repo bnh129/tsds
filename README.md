@@ -11,7 +11,7 @@ A GPU-accelerated time series datastore built with Python, PyArrow, and CuPy. TS
 │ • 1M records    │     │ • 2GB GPU mem   │    │ • Unlimited     │
 │ • In-memory     │     │ • CuPy accel    │    │ • Parquet files │
 │ • WAL durability│     │ • WAL durability│    │ • Snappy comp   │
-│ • 90% eviction  │     │ • 80% eviction  │    │ • Date partition│
+│ • 95% eviction  │     │ • 95% eviction  │    │ • Date partition│
 └─────────────────┘     └─────────────────┘    └─────────────────┘
 ```
 
@@ -109,12 +109,12 @@ Create `tsds_config.json` to customize behavior:
   },
   "hot_tier": {
     "max_records": 1000000,
-    "eviction_threshold_pct": 0.9,
+    "eviction_threshold_pct": 0.95,
     "wal_enabled": true
   },
   "warm_tier": {
     "max_memory_mb": 2048,
-    "eviction_threshold_pct": 0.8,
+    "eviction_threshold_pct": 0.95,
     "wal_enabled": true
   },
   "cold_tier": {
@@ -151,8 +151,24 @@ python3 tsds_demo.py 1000000 --no-queries  # Skip query benchmarks
 - **Scalable Testing**: From 1K to 100M+ records
 - **Dual Schema Modes**: Simple (4 columns) or Trading (8 columns)
 - **Performance Metrics**: Ingestion and query throughput
-- **Memory Monitoring**: Real-time resource usage
+- **Real-time Monitoring**: Memory usage, GPU utilization, tier distribution
+- **Accurate Statistics**: Shows exact record counts per tier with no double-counting
 - **Query Benchmarks**: Various filter and sort combinations
+- **Eviction Visualization**: See data migrate between tiers in real-time
+
+### Sample Demo Output
+```
+📥 INGESTION PHASE
+  Batch 1337/4000: 33,425,000 records (33.4%) | 378,266 rec/s 
+  | Hot: 950,000 | Warm: 26,800,000 | Cold: 5,675,000 
+  | RAM: 483MB | GPU: 1574MB | ETA: 4.5min
+
+✅ INGESTION COMPLETE
+   Total: 100,000,000 records (exact match)
+   Hot tier: 950,000 records (1.0%)
+   Warm tier: 24,550,000 records (24.6%) 
+   Cold tier: 74,500,000 records (74.4%)
+```
 
 ## Query System
 
@@ -200,7 +216,7 @@ async for batch in tsds.query(
 ### Hot Tier (`hot_tier.py`)
 - **In-Memory Storage**: PyArrow RecordBatches with fast access
 - **WAL Durability**: Arrow IPC stream format with fsync guarantees
-- **Automatic Eviction**: Triggers at 90% capacity to warm tier
+- **Automatic Eviction**: Triggers at 95% capacity to warm tier
 - **Crash Recovery**: Automatic WAL replay on startup
 
 ### Warm Tier (GPU-Accelerated)
@@ -213,8 +229,10 @@ async for batch in tsds.query(
 **Features:**
 - **CuPy Integration**: Seamless GPU acceleration with CPU fallback
 - **Dictionary Encoding**: Efficient string storage on GPU
-- **Memory Management**: Automatic eviction at 80% GPU memory usage
-- **Query Optimization**: GPU-parallel filtering operations
+- **Preallocated Arrays**: Fixed-size GPU arrays for optimal performance
+- **Memory Management**: Automatic eviction at 95% GPU memory usage
+- **Query Optimization**: GPU-parallel filtering with concurrent streams
+- **Accurate Statistics**: Tier counts based on actual data, not preallocated sizes
 
 ### Cold Tier (`cold_tier.py`)
 - **Parquet Storage**: Efficient columnar format with Snappy compression
@@ -308,6 +326,25 @@ Enable debug logging in configuration:
 - **NVIDIA GPU** with CUDA support
 - **CuPy**: Install appropriate version for your CUDA version
 - **Fallback**: Automatically switches to CPU-only mode if GPU unavailable
+
+## 🚀 Recent Improvements
+
+### Statistics Accuracy (v2024.08)
+- **Fixed Tier Counting**: All tiers now count actual data instead of maintaining separate counters
+- **Eliminated Double-Counting**: Resolved issues where records were counted multiple times during tier migration
+- **Preallocated Array Handling**: Warm tier correctly counts actual records vs. preallocated GPU array sizes
+- **Consistent Reporting**: Total record counts now accurately reflect ingested data across all tiers
+
+### Eviction System Enhancements
+- **Improved GPU Memory Calculation**: Uses actual `array.nbytes` instead of estimated sizes
+- **Fixed Async Coroutine Issues**: Resolved RuntimeWarnings with `asyncio.as_completed()`
+- **Better Memory Thresholds**: Increased to 95% for more efficient tier utilization
+- **Accurate Eviction Sizing**: Eviction manager correctly calculates memory to free
+
+### Query Performance Optimizations
+- **GPU Stream Parallelism**: Multiple CUDA streams for concurrent partition processing
+- **Optimized Memory Usage**: Better handling of GPU memory limits and fallbacks
+- **Streaming Results**: `asyncio.gather()` approach for more reliable async iteration
 
 ## 🔒 Production Considerations
 

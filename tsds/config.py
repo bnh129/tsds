@@ -44,6 +44,7 @@ class ColdTierConfig:
     compression: str
     index_batch_interval: float
     staging_enabled: bool
+    max_thread_workers: int
 
 
 @dataclass

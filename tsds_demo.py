@@ -198,11 +198,11 @@ async def run_comprehensive_queries(tsds, start_time: datetime, schema_mode: str
     # Sorting tests
     print(f"\n  🔄 SORTING TESTS")
     
-    # Descending sort test
-    print(f"    Testing range query with DESCENDING sort by '{sort_column}'...")
+    # Descending sort test with limit for performance
+    print(f"    Testing query with DESCENDING sort by '{sort_column}' (TOP 10)...")
     query_start = time.time()
     desc_results = []
-    async for result_batch in tsds.query(filters=range_filter, sort_by=sort_column, ascending=False):
+    async for result_batch in tsds.query(sort_by=sort_column, ascending=False, limit=10):
         desc_results.append(result_batch)
         
     query_time = (time.time() - query_start) * 1000
@@ -217,11 +217,11 @@ async def run_comprehensive_queries(tsds, start_time: datetime, schema_mode: str
         for _, row in sample.iterrows():
             print(f"        {row['timestamp']} | {row['symbol']} | {sort_column}: {row[sort_column]}")
     
-    # Ascending sort test
-    print(f"    Testing range query with ASCENDING sort by '{sort_column}'...")
+    # Ascending sort test with limit for performance
+    print(f"    Testing query with ASCENDING sort by '{sort_column}' (TOP 10)...")
     query_start = time.time()
     asc_results = []
-    async for result_batch in tsds.query(filters=range_filter, sort_by=sort_column, ascending=True):
+    async for result_batch in tsds.query(sort_by=sort_column, ascending=True, limit=10):
         asc_results.append(result_batch)
         
     query_time = (time.time() - query_start) * 1000
@@ -235,6 +235,31 @@ async def run_comprehensive_queries(tsds, start_time: datetime, schema_mode: str
         sample = result_table.slice(0, 5).to_pandas()
         for _, row in sample.iterrows():
             print(f"        {row['timestamp']} | {row['symbol']} | {sort_column}: {row[sort_column]}")
+    
+    # Ultra-fast tiny query tests
+    print(f"    Testing TINY queries with limits to demonstrate sub-second performance...")
+    
+    # Test with limit=5 (should trigger ultra-fast path)
+    print(f"    Testing tiny query: TOP 5 records with sort...")
+    query_start = time.time()
+    tiny_results = []
+    async for result_batch in tsds.query(sort_by=sort_column, ascending=False, limit=5):
+        tiny_results.append(result_batch)
+    
+    query_time = (time.time() - query_start) * 1000
+    total_tiny_results = sum(b.num_rows for b in tiny_results)
+    print(f"      TOP 5: {total_tiny_results:,} records in {query_time:.1f}ms")
+    
+    # Test with limit=50 (should also trigger ultra-fast path)
+    print(f"    Testing small query: TOP 50 records with sort...")
+    query_start = time.time()
+    small_results = []
+    async for result_batch in tsds.query(sort_by=sort_column, ascending=True, limit=50):
+        small_results.append(result_batch)
+    
+    query_time = (time.time() - query_start) * 1000
+    total_small_results = sum(b.num_rows for b in small_results)
+    print(f"      TOP 50: {total_small_results:,} records in {query_time:.1f}ms")
 
 
 async def demo_tsds(total_records: int, batch_size: int = None, schema_mode: str = "trading", 
@@ -323,9 +348,9 @@ async def demo_tsds(total_records: int, batch_size: int = None, schema_mode: str
             batch_time = time.time() - batch_start
             current_time = time.time()
             
-            # Progress reporting (every 5 seconds or every 100 batches for small datasets)
-            report_interval = 5.0 if total_records > 100_000 else 100
-            should_report = (current_time - last_report_time >= 5.0) or (batch_idx % 100 == 0) or (batch_idx == total_batches - 1)
+            # Progress reporting (every 15 seconds or every 500 batches for small datasets)
+            report_interval = 15.0 if total_records > 100_000 else 500
+            should_report = (current_time - last_report_time >= 15.0) or (batch_idx % 500 == 0) or (batch_idx == total_batches - 1)
             
             if should_report:
                 elapsed = current_time - ingestion_start
@@ -339,6 +364,7 @@ async def demo_tsds(total_records: int, batch_size: int = None, schema_mode: str
                 progress_pct = (total_ingested / total_records) * 100
                 eta_seconds = (total_records - total_ingested) / overall_throughput if overall_throughput > 0 else 0
                 
+                gpu_mem_mb = stats['warm_tier'].get('gpu_memory_mb', 0.0)
                 print(f"  Batch {batch_idx+1:4d}/{total_batches}: "
                       f"{total_ingested:8,} records ({progress_pct:5.1f}%) "
                       f"| {batch_throughput:7.0f} rec/s "
@@ -346,6 +372,7 @@ async def demo_tsds(total_records: int, batch_size: int = None, schema_mode: str
                       f"| Warm: {stats['warm_tier']['total_records']:7,} "
                       f"| Cold: {stats['cold_tier']['total_records']:8,} "
                       f"| RAM: {memory['rss_mb']:5.0f}MB "
+                      f"| GPU: {gpu_mem_mb:5.0f}MB "
                       f"| ETA: {eta_seconds/60:.1f}min")
                 
                 last_report_time = current_time
@@ -385,11 +412,16 @@ async def demo_tsds(total_records: int, batch_size: int = None, schema_mode: str
         print("-" * 20)
         print(f"  Process RAM: {final_memory['rss_mb']:.1f}MB")
         print(f"  System available: {final_memory['system_available_mb']:.1f}MB")
-        if final_stats['warm_tier']['gpu_memory_mb'] > 0:
+        if 'gpu_memory_mb' in final_stats['warm_tier'] and final_stats['warm_tier']['gpu_memory_mb'] > 0:
             print(f"  GPU memory: {final_stats['warm_tier']['gpu_memory_mb']:.1f}MB")
         
-        # Query tests
+        # Wait for background processing before queries
         if run_queries:
+            print(f"\n⏳ WAITING FOR BACKGROUND PROCESSING")
+            print("-" * 40)
+            await tsds.wait_for_background_processing()
+            print("✅ Background processing complete!")
+            
             await run_comprehensive_queries(tsds, start_time, schema_mode)
         
         logger.info("=== TSDS Demo Completed Successfully ===")

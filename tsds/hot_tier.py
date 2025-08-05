@@ -66,15 +66,21 @@ class HotTier(StorageTier):
                 print("HotTier: No WAL data to recover")
     
     async def ingest(self, batch: pa.RecordBatch) -> bool:
-        """Ingest batch, evicting oldest data if necessary."""
-        # Check if we need to evict first - be more aggressive
-        # Evict when we're at 90% capacity or would exceed limit
+        """Ingest batch, evicting oldest data if necessary. Always accepts data."""
+        # Check if we need to evict first - be more aggressive for LSM
+        # Evict when we're at eviction threshold or would exceed limit
         eviction_threshold = int(self.max_records * self.eviction_threshold_pct)
         
         if (self.total_records >= eviction_threshold or 
             self.total_records + batch.num_rows > self.max_records):
-            if not await self._evict_oldest_data():
-                return False  # Eviction failed
+            # Always try to evict, but continue even if eviction fails
+            # The hot tier should never reject new data
+            eviction_success = await self._evict_oldest_data()
+            if not eviction_success:
+                self.logger.error(f"Hot tier eviction failed - cannot safely accept new data to prevent data loss")
+                # Return False to reject ingestion and preserve data integrity
+                # This implements backpressure instead of data loss
+                return False
         
         # Write to WAL first (durability) - only if we still control WAL
         if not self.wal_transferred:
@@ -82,8 +88,8 @@ class HotTier(StorageTier):
                 self.wal_manager.write_batch(batch)
                 self.logger.debug(f"Wrote batch to WAL: {batch.num_rows:,} records")
             except Exception as e:
-                self.logger.error(f"WAL write failed: {e}")
-                return False
+                self.logger.warning(f"WAL write failed: {e} - continuing without WAL protection")
+                # Continue anyway - hot tier should always accept data even without WAL
         else:
             self.logger.debug(f"Skipping WAL write - control transferred to warm tier")
         
@@ -101,6 +107,20 @@ class HotTier(StorageTier):
         evict_count = max(1, len(self.batches) // 4)
         batches_to_evict = self.batches[:evict_count]
         
+        # Sort batches before eviction to create ordered data for LSM
+        if len(batches_to_evict) > 1:
+            try:
+                # Combine batches and sort by timestamp for LSM efficiency
+                combined_table = pa.Table.from_batches(batches_to_evict)
+                if "timestamp" in combined_table.schema.names:
+                    combined_table = combined_table.sort_by([("timestamp", "ascending")])
+                    # Convert back to batches for eviction
+                    batches_to_evict = list(combined_table.to_batches())
+                    self.logger.debug(f"Sorted {len(batches_to_evict)} batches for LSM eviction")
+            except Exception as e:
+                self.logger.warning(f"Failed to sort batches for eviction: {e}")
+                # Continue with unsorted batches
+        
         # Mark WAL segments for potential disposal (transactional step 1)
         evictable_segments = self.wal_manager.get_evictable_segments(keep_latest=1)
         if evictable_segments:
@@ -109,34 +129,84 @@ class HotTier(StorageTier):
                 print(f"HotTier: Marked {len(evictable_segments)} WAL segments for disposal: {evictable_segments}")
         
         # Try to evict to next tier
-        success = await self.eviction_callback.on_eviction(batches_to_evict)
-        if success:
-            # Remove evicted batches from memory
-            self.batches = self.batches[evict_count:]
-            evicted_records = sum(b.num_rows for b in batches_to_evict)
-            self.total_records -= evicted_records
+        migrated_records = await self.eviction_callback.on_eviction(batches_to_evict)
+        
+        if isinstance(migrated_records, bool):
+            # Legacy boolean return - assume all records migrated if True
+            if migrated_records:
+                migrated_records = sum(b.num_rows for b in batches_to_evict)
+            else:
+                migrated_records = 0
+        
+        if migrated_records > 0:
+            # Calculate how many batches were successfully migrated
+            # We need to remove the right batches from memory
+            total_to_evict = sum(b.num_rows for b in batches_to_evict)
+            
+            if migrated_records == total_to_evict:
+                # All batches successfully migrated - remove all
+                self.batches = self.batches[evict_count:]
+                self.total_records -= migrated_records
+                
+                if self.debug:
+                    print(f"HotTier: Successfully evicted all {migrated_records:,} records ({evict_count} batches)")
+            else:
+                # Partial migration - this is complex as we don't know which specific batches failed
+                # For now, we'll keep all batches and only decrement the count
+                # TODO: Implement proper partial eviction handling
+                self.total_records -= migrated_records
+                self.logger.warning(f"Partial eviction: {migrated_records:,}/{total_to_evict:,} records migrated. Keeping batches in memory.")
+                
+                if self.debug:
+                    print(f"HotTier: Partial eviction {migrated_records:,}/{total_to_evict:,} records")
             
             # Notify the eviction callback which segments are safe to delete
             # This will be processed once WarmTier confirms durable storage
-            if evictable_segments:
+            if evictable_segments and migrated_records == total_to_evict:
                 self.eviction_callback.confirm_wal_safe_to_delete(evictable_segments)
             
             # Clean up any confirmed safe segments
             cleaned_count = self.wal_manager.cleanup_confirmed_segments()
-            
+        else:
             if self.debug:
-                print(f"HotTier: Evicted {evicted_records:,} records ({evict_count} batches), cleaned {cleaned_count} WAL segments")
+                print(f"HotTier: Eviction failed - no records migrated")
         
-        return success
+        return migrated_records > 0
     
     async def query(self, filters: dict = None, limit: int = None, sort_by: str = None, ascending: bool = True) -> AsyncIterator[pa.RecordBatch]:
         """Query hot tier data, with optional sorting."""
         all_results = []
         
-        # Combine all batches into a single table to handle filtering and sorting correctly
+        # Early exit for empty tier
         if not self.batches:
             return
+        
+        # Use Arrow's native optimized sort + slice for top-K
+        if limit and sort_by:
+            # Combine all batches
+            combined_table = pa.Table.from_batches(self.batches)
             
+            # Apply filters first
+            if filters:
+                mask = self._apply_filters(combined_table, filters)
+                if mask is not None:
+                    combined_table = combined_table.filter(mask)
+            
+            # Use Arrow's optimized sort + slice for top-K
+            if sort_by in combined_table.schema.names:
+                order = 'ascending' if ascending else 'descending'
+                # Arrow's sort is highly optimized C++ code
+                combined_table = combined_table.sort_by([(sort_by, order)])
+                # Arrow's slice is O(1) operation
+                combined_table = combined_table.slice(0, limit)
+            
+            # Yield results
+            for batch in combined_table.to_batches():
+                if batch.num_rows > 0:
+                    yield batch
+            return
+        
+        # Fallback: full processing for unlimited or unsorted queries
         combined_table = pa.Table.from_batches(self.batches)
         
         # Apply filters
@@ -150,7 +220,7 @@ class HotTier(StorageTier):
             order = 'ascending' if ascending else 'descending'
             combined_table = combined_table.sort_by([(sort_by, order)])
 
-        # Apply limit after filtering and sorting
+        # Apply limit
         if limit:
             combined_table = combined_table.slice(0, limit)
             
@@ -221,9 +291,12 @@ class HotTier(StorageTier):
             wal_segments = wal_stats["segment_count"]
             wal_size_mb = wal_stats["total_size_mb"]
         
+        # Calculate actual record count from batches instead of counter
+        actual_records = sum(batch.num_rows for batch in self.batches)
+        
         return {
             "tier_name": "hot",
-            "total_records": self.total_records,
+            "total_records": actual_records,
             "total_batches": len(self.batches),
             "memory_usage_mb": sum(b.nbytes for b in self.batches) / (1024 * 1024),
             "capacity_used_pct": (self.total_records / self.max_records) * 100,

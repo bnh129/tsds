@@ -12,13 +12,14 @@
   },
   "warm_tier": {
     "max_memory_mb": 2048,
-    "eviction_threshold_pct": 0.8,
+    "eviction_threshold_pct": 0.9,
     "wal_enabled": true
   },
   "cold_tier": {
     "compression": "snappy",
     "index_batch_interval": 1.0,
-    "staging_enabled": true
+    "staging_enabled": true,
+    "max_thread_workers": 8
   },
   "query": {
     "output_batch_size": 4096,
@@ -33,7 +34,7 @@
     "time_column": "timestamp"
   },
   "logging": {
-    "level": "INFO",
+    "level": "DEBUG",
     "max_file_size_mb": 100,
     "max_files": 10,
     "format": "%(asctime)s | %(name)s | %(levelname)s | %(funcName)s:%(lineno)d | %(message)s"
